@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Convertisseur Shopify → Devaito (Production Ready)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    body{font-family:sans-serif;padding:18px;background:#f4f6f8}
+    .container{max-width:1000px;margin:auto;background:#fff;padding:24px;border-radius:8px;box-shadow:0 6px 16px rgba(0,0,0,.06)}
+    input[type=file]{margin-bottom:12px}
+    button{padding:10px 16px;border-radius:6px;border:none;background:#007bff;color:#fff;cursor:pointer}
+    .message{margin-top:14px;padding:12px;border-radius:6px}
+    .info{background:#e9f7ff;color:#055160}
+    .error{background:#ffecec;color:#7a1b1b}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Convertisseur Shopify → Devaito</h1>
+    <p>Outil de conversion de produits depuis Shopify: prend en charge toutes les variantes, options et couleurs, avec export direct vers CSV Devaito.</p>
+
+    <input id="csvFile" type="file" accept=".csv" />
+    <button onclick="startConversion()">Convertir</button>
+    <div id="message" class="message info">Sélectionnez un fichier CSV pour commencer.</div>
+  </div>
+
+<script>
+// ---------------- CONFIG ----------------
+const defaultUnitId = null; // Utilisez un ID d’unité existant ou laissez null pour cellule vide
+
+const devaitoHeaders = [
+  "product_id","name","brand","summary","description","product_type","supplier","permalink","unit","conditions","has_variant",
+  "discount_type","discount_amount","pdf_specifications","thumbnail_image","video_link","is_featured","max_item_on_purchase",
+  "min_item_on_purchase","low_stock_quantity_alert","is_authentic","has_warranty","has_replacement_warranty","warrenty_days",
+  "is_refundable","shipping_location_type","is_active_cod","is_active_free_shipping","cod_location_type","is_active_attatchment",
+  "attatchment_name","shipping_cost","is_apply_multiple_qty_shipping_cost","is_enable_tax","tax_profile","status","id_cj",
+  "id_lacaisse","profil_imported_countries","has_options","thumbnail_image_id","thumbnail_image_path","single_sku","single_purchase_price",
+  "single_unit_price","single_quantity","categories_ids","colors_ids","categories_permalinks","colors_names","collections_ids",
+  "collections_permalinks","tags_ids","tags_permalinks","variants_json","option_groups_json","color_images_json","seo_meta_title",
+  "seo_meta_description","seo_meta_image_id","seo_meta_image_path","created_at","updated_at"
+];
+
+const colorMapping = {
+  'beige':'color:20','black':'color:21','blue':'color:22','bronze':'color:23','brown':'color:24','clear':'color:25','gold':'color:26',
+  'gray':'color:27','grey':'color:27','green':'color:28','navy':'color:29','orange':'color:30','pink':'color:31','purple':'color:32',
+  'rose-gold':'color:33','silver':'color:34','white':'color:35','yellow':'color:36','red':'color:37','olive':'color:38','maroon':'color:39',
+  'teal':'color:40','mint':'color:41','peach':'color:42','lavender':'color:43','cream':'color:44','khaki':'color:45','rose':'color:46',
+  'magenta':'color:47','cyan':'color:48','turquoise':'color:49','indigo':'color:50'
+};
+
+const sizeMapping = { 's':'2:10','m':'2:11','l':'2:12','xl':'2:13','xxl':'2:14','xxxl':'2:15' };
+const optionSynonyms = { size: ['size','taille','pointure'], color: ['color','colour','couleur'] };
+
+function setMessage(text, type){ const el=document.getElementById('message'); el.innerText=text; el.className=`message ${type||'info'}`; }
+function normalizeKey(s){ return s?String(s).toLowerCase().trim():''; }
+function titleCase(s){ return s?String(s).split(/\s+/).map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' '):s; }
+
+function findCategory(optionName){
+  const n=normalizeKey(optionName);
+  for(const k in optionSynonyms){ for(const syn of optionSynonyms[k]) if(n.includes(syn)) return k==='size'?'Size':'Color'; }
+  if(n.includes('color')||n.includes('couleur')) return 'Color';
+  if(n.includes('size')||n.includes('taille')) return 'Size';
+  return null;
+}
+
+function mapValue(optionName,val){
+  const cat=findCategory(optionName); const key=normalizeKey(val);
+  if(cat==='Color') return colorMapping[key]||null;
+  if(cat==='Size') return sizeMapping[key]||null;
+  return null;
+}
+
+function generateSKU(handle,optionsObj={},idx=0){
+  const p=handle?String(handle).replace(/[^A-Za-z0-9]/g,'').substring(0,6).toUpperCase():'PRD';
+  const opt=Object.values(optionsObj).map(v=>String(v).replace(/\s+/g,'_')).join('_').substring(0,10).toUpperCase()||`X${idx}`;
+  return `${p}_${opt}_${Math.floor(Math.random()*9000)+1000}`;
+}
+
+function parseColorPattern(firstRow){
+  const keys=['Color (product.metafields.shopify.color-pattern)','Color (product.metafields.shopify.color_pattern)','Color','color'];
+  for(const k of keys){ if(firstRow[k]&&String(firstRow[k]).trim()!=='') return String(firstRow[k]).split(/;|,|\|/).map(x=>x.trim()).filter(Boolean); }
+  return [];
+}
+
+function startConversion(){
+  const f=document.getElementById('csvFile').files[0];
+  if(!f){ setMessage('Veuillez sélectionner un fichier CSV.','error'); return; }
+  setMessage('Parsing CSV...','info');
+  Papa.parse(f,{header:true,dynamicTyping:false,skipEmptyLines:true,
+    complete:res=>{ try{ processData(res.data);}catch(e){ setMessage('Erreur: '+e.message,'error');console.error(e);} },
+    error:err=>setMessage('Erreur parsing: '+err.message,'error') });
+}
+
+function detectOptionName(rows,i){
+  const f=`Option${i} Name`; for(let j=rows.length-1;j>=0;j--){ const v=rows[j][f]; if(v&&String(v).trim()!=='') return String(v).trim(); }
+  return '';
+}
+
+function processData(data){
+  const grouped={}; data.forEach(r=>{const h=r.Handle?String(r.Handle):'__no_handle__'; if(!grouped[h]) grouped[h]=[]; grouped[h].push(r);});
+  let id=11; const out=[];
+
+  for(const handle in grouped){
+    const rows=grouped[handle]; const first=rows[0]||{};
+    const opt1=detectOptionName(rows,1),opt2=detectOptionName(rows,2),opt3=detectOptionName(rows,3);
+    const optionValues={}; const variants=[]; const colorImgs={}; let idx=0;
+    parseColorPattern(first).forEach(c=>{ if(!optionValues['Color']) optionValues['Color']=new Set(); optionValues['Color'].add(c); });
+
+    const vRows=rows.filter(r=>(r['Option1 Value']&&r['Option1 Value'].trim())||(r['Option2 Value']&&r['Option2 Value'].trim())||(r['Option3 Value']&&r['Option3 Value'].trim()));
+    const rowsTo=vRows.length>0?vRows:rows;
+
+    for(const r of rowsTo){
+      const options_key={}; const parts=[];
+      function proc(name,val){
+        if(!name||!String(name).trim()) return; if(!val||!String(val).trim()) return;
+        const raw=String(name).trim(), norm=normalizeKey(raw); if(norm==='title'||norm==='handle') return;
+        const cat=findCategory(raw); const canon=cat==='Color'?'Color':cat==='Size'?'Size':titleCase(raw); const v=String(val).trim();
+        if(!optionValues[canon]) optionValues[canon]=new Set(); optionValues[canon].add(v);
+        if(norm.includes('color')&&r['Image Src']){ const nv=normalizeKey(v); if(!colorImgs[nv]) colorImgs[nv]=r['Image Src']; }
+        const mapped=mapValue(raw,v); if(mapped) parts.push(mapped); else parts.push(`${canon.toLowerCase()}:custom_${normalizeKey(v).replace(/[^a-z0-9_]/g,'_')}`);
+        options_key[(cat === 'Color' ? 'color' : canon)]=v;
+      }
+      proc(opt1,r['Option1 Value']); proc(opt2,r['Option2 Value']); proc(opt3,r['Option3 Value']);
+      if(parts.length>0){
+        variants.push({sku:(r['Variant SKU']&&r['Variant SKU'].trim())?r['Variant SKU'].trim():generateSKU(handle,options_key,idx++),
+          purchase_price:r['Cost per item']?+parseFloat(r['Cost per item']):0,
+          unit_price:r['Variant Price']?+parseFloat(r['Variant Price']):0,
+          quantity:r['Variant Inventory Qty']?(isNaN(parseInt(r['Variant Inventory Qty']))?0:parseInt(r['Variant Inventory Qty'])):0,
+          variant:parts.join('/'),options_key});
+      }
+    }
+
+    const optionGroups=[]; for(const [n,vals] of Object.entries(optionValues)){ if(vals&&vals.size>0) optionGroups.push({name:n,is_color:normalizeKey(n).includes('color')}); }
+    optionGroups.sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+    const colorImages=Object.entries(colorImgs).map(([n,ip])=>({color_name:n,image_id:'',image_path:ip}));
+
+    const single=variants.length===0;
+    const prod={ product_id:id++, name:first.Title||handle||'Untitled', brand:first.Vendor||'', summary:first['Body (HTML)']?String(first['Body (HTML)']).substring(0,200)+'...':'',
+      description:first['Body (HTML)']||'', product_type:'', supplier:'', permalink:first.Handle||handle, unit:(defaultUnitId===null?null:defaultUnitId), conditions:'',
+      has_variant:variants.length>0?1:2, discount_type:2, discount_amount:Math.max(0,parseFloat(first['Variant Compare At Price'])||0), pdf_specifications:'',
+      thumbnail_image:first['Image Src']||'', video_link:'', is_featured:2, max_item_on_purchase:10, min_item_on_purchase:1, low_stock_quantity_alert:5,
+      is_authentic:1, has_warranty:2, has_replacement_warranty:2, warrenty_days:0, is_refundable:1, shipping_location_type:'anywhere', is_active_cod:1,
+      is_active_free_shipping:2, cod_location_type:'', is_active_attatchment:2, attatchment_name:'', shipping_cost:0, is_apply_multiple_qty_shipping_cost:2,
+      is_enable_tax:1, tax_profile:1, status:(first.Published===true||String(first.Published).toLowerCase()==='true')?1:2, id_cj:'', id_lacaisse:'', profil_imported_countries:'',
+      has_options:(optionGroups.length>0&&variants.length>0)?1:2, thumbnail_image_id:'', thumbnail_image_path:first['Image Src']||'',
+      single_sku:single?(first['Variant SKU']?first['Variant SKU']:''):''||generateSKU(handle,{},0),
+      single_purchase_price:single?(first['Cost per item']?+parseFloat(first['Cost per item']):''):'',
+      single_unit_price:single?(first['Variant Price']?+parseFloat(first['Variant Price']):''):'',
+      single_quantity:single?(first['Variant Inventory Qty']?(isNaN(parseInt(first['Variant Inventory Qty']))?'':parseInt(first['Variant Inventory Qty'])):''):'',
+      categories_ids:'', colors_ids:'', categories_permalinks:first['Product Category']||'', colors_names:optionValues['Color']?Array.from(optionValues['Color']).join(','):'',
+      collections_ids:'', collections_permalinks:'', tags_ids:'', tags_permalinks:first.Tags||'',
+      variants_json:variants.length>0?JSON.stringify(variants):'[]', option_groups_json:/*(optionGroups.length>0&&variants.length>0)?JSON.stringify(optionGroups):*/'[]',
+      color_images_json:(colorImages.length>0&&variants.length>0)?JSON.stringify(colorImages):'[]',
+      seo_meta_title:first['SEO Title']||'', seo_meta_description:first['SEO Description']||'', seo_meta_image_id:'', seo_meta_image_path:'',
+      created_at:new Date().toISOString().split('T')[0]+' 00:00:00', updated_at:new Date().toISOString().split('T')[0]+' 00:00:00'};
+    out.push(prod);
+  }
+
+  downloadCSV(out);
+}
+
+function downloadCSV(data){
+  const csvRows=[devaitoHeaders.join(';')];
+  for(const prod of data){
+    const row=devaitoHeaders.map(h=>{let v=prod[h]; if(v===undefined||v===null) return ''; if(['variants_json','option_groups_json','color_images_json'].includes(h)){ const s=typeof v==='string'?v:JSON.stringify(v); return '"'+s.replace(/"/g,'""')+'"'; } return String(v).replace(/;/g,','); });
+    csvRows.push(row.join(';'));
+  }
+  const csvContent=csvRows.join('\n'); const blob=new Blob([csvContent],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='shopify_to_devaito.csv'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setMessage('Conversion terminée — fichier prêt.','info');
+}
+</script>
+</body>
+</html>
